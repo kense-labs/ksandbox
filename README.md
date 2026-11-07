@@ -1,14 +1,14 @@
 # KSandbox
 
-KSandbox is a Rust-native, fail-closed command boundary for [kbox](https://github.com/kense-labs/kbox) Bash and other kbox products. It turns an untrusted command into a bounded process tree with explicit workspace, credential, environment, network, and lifecycle limits enforced by the host operating system.
+KSandbox is a Rust-native, fail-closed **process sandbox for agents**. It runs untrusted tool commands as a bounded process tree, with workspace, credential, environment, network, and lifecycle limits enforced by the host OS—so any agent host (CLI, IDE, orchestrator, or SDK) can embed the same boundary.
 
-There is no Node.js runtime, npm package, or SRT process in the execution path. The library is independent of kbox Code so a CLI, agent, or SDK can embed it.
+There is no Node.js runtime, npm package, or product-specific daemon in the execution path.
 
 English | [简体中文](README.zh-CN.md)
 
 ## How it works
 
-KSandbox is a **library and CLI, not a daemon**. Your host process constructs a `NativeSandbox` for one workspace, then runs commands through it:
+KSandbox is a **library and CLI, not a daemon**. Your agent constructs a `NativeSandbox` for one workspace, then runs tool commands through it:
 
 - Policy is the single source of truth. Platform backends enforce it; they never silently broaden when a host feature is missing.
 - Backends are selected at compile time: Seatbelt on macOS, Bubblewrap + seccomp on Linux, AppContainer + Job Object on Windows.
@@ -72,11 +72,11 @@ cargo build --release
 
 ## What is enforced
 
-The default kbox Bash profile is intentionally strict:
+The default agent profile is intentionally strict:
 
 - network access and host Unix-domain sockets are denied
 - writes are limited to the canonical workspace and a private scratch directory
-- credentials, secret files, `.git`, `.aster`, agent metadata, and shell/tool bootstrap files are protected
+- credentials, secret files, `.git`, agent metadata, and shell/tool bootstrap files are protected
 - symbolic-link escapes and source-tree hard-link aliases are rejected
 - child environments are sanitized; shell injection variables are removed
 - host-held secrets are delivered only as redacted sentinels unless mediation is active
@@ -98,7 +98,7 @@ Windows executions are serialized because temporary ACL and device-map changes a
 
 ## Scope
 
-Gate 0—the complete kbox Bash baseline—is shipped and tested on macOS, Linux, and Windows. Later gates add typed policy, resource quotas, deeper mounts, opt-in mediated HTTP(S) / SOCKS, grants, and security release packaging. Virtual bash and in-process language VMs are non-goals.
+The deny-all baseline is shipped and tested on macOS, Linux, and Windows. Later gates add typed policy, resource quotas, deeper mounts, opt-in mediated HTTP(S) / SOCKS, grants, and security release packaging. Virtual bash and in-process language VMs are non-goals.
 
 See [ROADMAP.md](ROADMAP.md) for ranked capabilities and exit criteria. Release evidence helpers live under [docs/](docs/) and `scripts/`.
 

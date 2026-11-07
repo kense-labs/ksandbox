@@ -2,13 +2,13 @@
 
 [English](README.md) | 简体中文
 
-KSandbox 是面向 [kbox](https://github.com/kense-labs/kbox) Bash 及其他 kbox 产品的 Rust 原生、失败闭合（fail-closed）命令边界。它将不受信任的命令变成有界进程树，并由宿主操作系统强制执行显式的工作区、凭证、环境、网络与生命周期限制。
+KSandbox 是面向**任意 Agent** 的 Rust 原生、失败闭合（fail-closed）**进程沙箱**。它把不受信任的工具命令关进有界进程树，由宿主操作系统强制执行工作区、凭证、环境、网络与生命周期限制；CLI、IDE、编排器或 SDK 都可以嵌入同一套边界。
 
-执行路径中没有 Node.js 运行时、npm 包或 SRT 进程。该库独立于 kbox Code，可被 CLI、Agent 或 SDK 嵌入。
+执行路径中没有 Node.js 运行时、npm 包或产品专用守护进程。
 
 ## 工作模型
 
-KSandbox 是 **库与 CLI，不是守护进程**。宿主为某个工作区构造 `NativeSandbox`，再通过它执行命令：
+KSandbox 是 **库与 CLI，不是守护进程**。Agent 为主机工作区构造 `NativeSandbox`，再通过它执行工具命令：
 
 - 策略层是唯一真相来源。平台后端强制执行策略；宿主功能缺失时不会静默放宽。
 - 后端在编译时选择：macOS 用 Seatbelt，Linux 用 Bubblewrap + seccomp，Windows 用 AppContainer + Job Object。
@@ -72,11 +72,11 @@ cargo build --release
 
 ## 当前强制执行的内容
 
-默认的 kbox Bash 配置故意严格：
+默认的 Agent 配置故意严格：
 
 - 拒绝网络访问与宿主 Unix 域套接字
 - 写入仅限于规范工作区与私有临时目录
-- 保护凭证、密钥文件、`.git`、`.aster`、Agent 元数据，以及 shell/工具引导文件
+- 保护凭证、密钥文件、`.git`、Agent 元数据，以及 shell/工具引导文件
 - 拒绝符号链接与源树硬链接逃逸
 - 清理子进程环境，并移除 shell 注入变量
 - 宿主持有密钥仅以脱敏哨兵下发；未开启中介时拒绝运行
@@ -98,7 +98,7 @@ Windows 执行会串行化，因为临时 ACL 与设备映射变更是共享进�
 
 ## 范围
 
-Gate 0——完整的 kbox Bash 基线——已在 macOS、Linux 与 Windows 上交付并测试。后续门禁按第一性原理排序：类型化策略、资源配额、更深挂载、可选中介 HTTP(S)/SOCKS、grant，以及安全发布。虚拟 bash 与进程内语言 VM 为非目标。
+Deny-all 基线已在 macOS、Linux 与 Windows 上交付并测试。后续门禁按第一性原理排序：类型化策略、资源配额、更深挂载、可选中介 HTTP(S)/SOCKS、grant，以及安全发布。虚拟 bash 与进程内语言 VM 为非目标。
 
 使命、非目标与退出条件见 [ROADMAP.md](ROADMAP.md)。发布证据脚本见 [docs/](docs/) 与 `scripts/`。
 
