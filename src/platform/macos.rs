@@ -1,0 +1,360 @@
+//! macOS Seatbelt backend.
+
+use crate::policy::{path_ancestors, resolve_executable, EnforcedPolicy, ResolvedResourceBudget};
+use crate::process::run_tokio_command;
+use crate::{CommandOutput, CommandRequest};
+use anyhow::{bail, Context, Result};
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use tokio::process::Command;
+
+const MAX_SBPL_STRING_BYTES: usize = 1_024;
+
+#[derive(Debug)]
+pub(crate) struct PlatformSandbox {
+    sandbox_exec: PathBuf,
+    env: PathBuf,
+    shell: PathBuf,
+}
+
+impl PlatformSandbox {
+    pub(crate) fn new(workspace: &Path) -> Result<Self> {
+        Ok(Self {
+            sandbox_exec: resolve_executable("/usr/bin/sandbox-exec", workspace)
+                .context("macOS Seatbelt launcher is unavailable")?,
+            env: resolve_executable("/usr/bin/env", workspace)
+                .context("trusted macOS environment launcher is unavailable")?,
+            shell: resolve_executable("/bin/bash", workspace)
+                .context("trusted macOS bash executable is unavailable")?,
+        })
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        policy: &EnforcedPolicy,
+        request: CommandRequest,
+    ) -> Result<CommandOutput> {
+        let profile = compile_profile(policy)?;
+        let profile_path = policy.scratch.join("seatbelt.sb");
+        tokio::fs::write(&profile_path, profile)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to write Seatbelt profile {}",
+                    profile_path.display()
+                )
+            })?;
+
+        let budget = ResolvedResourceBudget::resolve(&policy.resources, request.timeout_ms)?;
+        budget.validate_for_backend(crate::policy::BackendCapabilities::native_gate2())?;
+
+        let environment = policy.child_environment(request.env.as_deref())?;
+        let mut command = Command::new(&self.sandbox_exec);
+        command
+            .arg("-f")
+            .arg(&profile_path)
+            .arg(&self.env)
+            .arg("-i");
+        for (key, value) in environment {
+            command.arg(environment_assignment(&key, &value));
+        }
+        command
+            .arg(&self.shell)
+            .arg("-c")
+            .arg(&request.command)
+            .current_dir(&policy.workspace)
+            .env_clear();
+
+        run_tokio_command(command, request, &budget, "macOS native sandbox command").await
+    }
+}
+
+fn environment_assignment(key: &OsStr, value: &OsStr) -> OsString {
+    let mut assignment = key.to_os_string();
+    assignment.push("=");
+    assignment.push(value);
+    assignment
+}
+
+fn compile_profile(policy: &EnforcedPolicy) -> Result<String> {
+    let mut lines = vec![
+        "(version 1)".to_string(),
+        "(deny default)".to_string(),
+        "(deny file-link)".to_string(),
+        "".to_string(),
+        "; Process lifecycle".to_string(),
+        "(allow process-exec)".to_string(),
+        "(allow process-fork)".to_string(),
+        "(allow process-info* (target same-sandbox))".to_string(),
+        "(allow signal (target same-sandbox))".to_string(),
+        "(allow mach-priv-task-port (target same-sandbox))".to_string(),
+        "".to_string(),
+        "; Minimal system services required by command-line tools".to_string(),
+        "(allow user-preference-read)".to_string(),
+        "(allow mach-lookup".to_string(),
+        "  (global-name \"com.apple.audio.systemsoundserver\")".to_string(),
+        "  (global-name \"com.apple.bsd.dirhelper\")".to_string(),
+        "  (global-name \"com.apple.cfprefsd.agent\")".to_string(),
+        "  (global-name \"com.apple.distributed_notifications@Uv3\")".to_string(),
+        "  (global-name \"com.apple.FontObjectsServer\")".to_string(),
+        "  (global-name \"com.apple.fonts\")".to_string(),
+        "  (global-name \"com.apple.logd\")".to_string(),
+        "  (global-name \"com.apple.lsd.mapdb\")".to_string(),
+        "  (global-name \"com.apple.PowerManagement.control\")".to_string(),
+        "  (global-name \"com.apple.securityd.xpc\")".to_string(),
+        "  (global-name \"com.apple.system.DirectoryService.libinfo_v1\")".to_string(),
+        "  (global-name \"com.apple.system.logger\")".to_string(),
+        "  (global-name \"com.apple.system.notification_center\")".to_string(),
+        "  (global-name \"com.apple.system.opendirectoryd.libinfo\")".to_string(),
+        "  (global-name \"com.apple.system.opendirectoryd.membership\")".to_string(),
+        ")".to_string(),
+        "(allow ipc-posix-shm)".to_string(),
+        "(allow ipc-posix-sem)".to_string(),
+        "(allow iokit-get-properties)".to_string(),
+        "(allow iokit-open".to_string(),
+        "  (iokit-registry-entry-class \"IOSurfaceRootUserClient\")".to_string(),
+        "  (iokit-registry-entry-class \"RootDomainUserClient\")".to_string(),
+        "  (iokit-user-client-class \"IOSurfaceSendRight\")".to_string(),
+        ")".to_string(),
+        "(allow system-socket (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))"
+            .to_string(),
+        "(allow sysctl-read)".to_string(),
+        "(allow distributed-notification-post)".to_string(),
+        "".to_string(),
+        "; Inherited descriptors and safe devices".to_string(),
+        "(allow file-read-data file-write-data (subpath \"/dev/fd\"))".to_string(),
+        "(allow file-read* file-write-data file-ioctl".to_string(),
+        "  (literal \"/dev/null\")".to_string(),
+        "  (literal \"/dev/zero\")".to_string(),
+        "  (literal \"/dev/random\")".to_string(),
+        "  (literal \"/dev/urandom\")".to_string(),
+        ")".to_string(),
+        "".to_string(),
+    ];
+
+    lines.push("; Network and Unix-domain sockets remain denied by default".to_string());
+    if let Some(port) = policy.mediator_port {
+        lines.push(format!(
+            "; Gate 4: loopback CONNECT mediator only (localhost:{port})"
+        ));
+        // Seatbelt requires host `*` or `localhost` in remote ip filters.
+        lines.push(format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))"
+        ));
+    }
+    if let Some(port) = policy.socks_mediator_port {
+        lines.push(format!(
+            "; Gate 5: loopback SOCKS5 mediator only (localhost:{port})"
+        ));
+        lines.push(format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))"
+        ));
+    }
+    if !policy.allow_unix_sockets.is_empty() {
+        lines.push("; Gate 5: exact Unix-domain socket allowlist".to_string());
+        for socket in &policy.allow_unix_sockets {
+            let path = escaped_path(socket)?;
+            lines.push(format!(
+                "(allow network-outbound (remote unix-socket (path-literal {path})))"
+            ));
+            // Connecting often needs metadata/read on the socket inode.
+            lines.push(format!("(allow file-read* (literal {path}))"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("; Filesystem reads".to_string());
+    lines.push("(allow file-read*)".to_string());
+
+    push_path_rule(&mut lines, "deny", &["file-read*"], &policy.deny_read)?;
+    push_path_rule(&mut lines, "allow", &["file-read*"], &policy.allow_read)?;
+
+    let late_read_denies = policy
+        .deny_read
+        .iter()
+        .filter(|denied| {
+            policy
+                .allow_read
+                .iter()
+                .any(|allowed| denied.starts_with(allowed))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    push_path_rule(&mut lines, "deny", &["file-read*"], &late_read_denies)?;
+    if !policy.deny_read.is_empty() {
+        lines.push("(allow file-read-metadata (vnode-type DIRECTORY))".to_string());
+    }
+
+    lines.push(String::new());
+    lines.push("; Filesystem writes".to_string());
+    push_path_rule(&mut lines, "allow", &["file-write*"], &policy.allow_write)?;
+    push_path_rule(&mut lines, "deny", &["file-write*"], &policy.deny_write)?;
+    // Late allow for goal-loop carve-outs under protected `.kbox`.
+    push_path_rule(
+        &mut lines,
+        "allow",
+        &["file-write*"],
+        &policy.write_exceptions,
+    )?;
+
+    let mut pinned = BTreeSet::new();
+    for path in &policy.deny_write {
+        pinned.insert(path.clone());
+        pinned.extend(path_ancestors(path));
+    }
+    // Do not pin create/unlink denies inside write exceptions.
+    for exception in &policy.write_exceptions {
+        pinned.retain(|path| path != exception && !path.starts_with(exception));
+    }
+    push_literal_rule(
+        &mut lines,
+        "deny",
+        &["file-write-unlink", "file-write-create"],
+        pinned,
+    )?;
+
+    Ok(lines.join("\n"))
+}
+
+fn push_path_rule(
+    lines: &mut Vec<String>,
+    action: &str,
+    operations: &[&str],
+    paths: &[PathBuf],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    lines.push(format!("({action} {}", operations.join(" ")));
+    for path in paths {
+        lines.push(format!("  (subpath {})", escaped_path(path)?));
+    }
+    lines.push(")".to_string());
+    Ok(())
+}
+
+fn push_literal_rule(
+    lines: &mut Vec<String>,
+    action: &str,
+    operations: &[&str],
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<()> {
+    let paths = paths.into_iter().collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(());
+    }
+    lines.push(format!("({action} {}", operations.join(" ")));
+    for path in paths {
+        lines.push(format!("  (literal {})", escaped_path(&path)?));
+    }
+    lines.push(")".to_string());
+    Ok(())
+}
+
+fn escaped_path(path: &Path) -> Result<String> {
+    let path = path
+        .to_str()
+        .with_context(|| format!("Seatbelt path is not UTF-8: {}", path.display()))?;
+    if path.contains('\0') {
+        bail!("Seatbelt path contains a NUL byte");
+    }
+    let escaped = serde_json::to_string(path).context("failed to escape Seatbelt path")?;
+    if escaped.len() > MAX_SBPL_STRING_BYTES {
+        bail!(
+            "Seatbelt path exceeds the {MAX_SBPL_STRING_BYTES}-byte profile string limit: {}",
+            path
+        );
+    }
+    Ok(escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn profile_denies_network_and_reasserts_workspace_secrets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join(".env"), "secret").unwrap();
+        let policy = EnforcedPolicy::for_execution(workspace.path(), scratch.path()).unwrap();
+
+        let profile = compile_profile(&policy).unwrap();
+        let canonical_workspace = workspace.path().canonicalize().unwrap();
+
+        assert!(!profile.contains("(allow network"));
+        assert!(!profile.contains("Gate 4: loopback CONNECT mediator"));
+        assert!(profile.contains("(deny file-link)"));
+        let workspace_rule = format!(
+            "(subpath {})",
+            serde_json::to_string(canonical_workspace.to_str().unwrap()).unwrap()
+        );
+        let secret_rule = format!(
+            "(subpath {})",
+            serde_json::to_string(canonical_workspace.join(".env").to_str().unwrap()).unwrap()
+        );
+        assert!(profile.matches(&workspace_rule).count() >= 2);
+        assert!(profile.matches(&secret_rule).count() >= 2);
+    }
+
+    #[test]
+    fn monorepo_seatbelt_profile_fits_compiled_data_limit() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace = workspace.canonicalize().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let policy = EnforcedPolicy::for_execution(&workspace, scratch.path()).unwrap();
+        let profile = compile_profile(&policy).unwrap();
+        let profile_path = scratch.path().join("seatbelt.sb");
+        std::fs::write(&profile_path, &profile).unwrap();
+        let output = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-f")
+            .arg(&profile_path)
+            .arg("/usr/bin/true")
+            .output()
+            .expect("sandbox-exec");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("exceeds maximum"),
+            "profile_bytes={} deny_read={} stderr={stderr}",
+            profile.len(),
+            policy.deny_read.len(),
+        );
+        assert!(
+            output.status.success(),
+            "profile_bytes={} deny_read={} stderr={stderr}",
+            profile.len(),
+            policy.deny_read.len(),
+        );
+    }
+
+    #[test]
+    fn escaped_path_quotes_special_characters() {
+        let path = Path::new("/tmp/kbox sandbox/quote\"file");
+        assert_eq!(
+            escaped_path(path).unwrap(),
+            r#""/tmp/kbox sandbox/quote\"file""#
+        );
+    }
+
+    #[test]
+    fn escaped_path_rejects_nul_and_oversized_values() {
+        let nul = Path::new("/tmp/with\0nul");
+        assert!(escaped_path(nul).unwrap_err().to_string().contains("NUL"));
+
+        let oversized = PathBuf::from(format!("/tmp/{}", "x".repeat(MAX_SBPL_STRING_BYTES)));
+        let error = escaped_path(&oversized).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_path_rejects_non_utf8_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'/', b't', b'm', b'p', 0xff,
+        ]));
+        let error = escaped_path(&path).unwrap_err();
+        assert!(error.to_string().contains("not UTF-8"));
+    }
+}

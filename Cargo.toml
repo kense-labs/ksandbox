@@ -1,0 +1,59 @@
+[package]
+name = "ksandbox"
+version = "0.2.3"
+edition = "2021"
+authors = ["kense-labs"]
+license = "MIT"
+repository = "https://github.com/kense-labs/sandbox"
+description = "Cross-platform native process command sandbox"
+keywords = ["sandbox", "security", "kense"]
+categories = ["os", "development-tools"]
+publish = false
+
+[lib]
+name = "ksandbox"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ksandbox"
+path = "src/bin/ksandbox.rs"
+
+[[bin]]
+name = "ksandbox-relay"
+path = "src/bin/ksandbox_relay.rs"
+
+[dependencies]
+anyhow = { version = "1.0", features = ["backtrace"] }
+async-trait = "0.1"
+dirs = "5.0"
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.10"
+tokio = { version = "1.35", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+base64 = "0.21"
+tracing = "0.1"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
