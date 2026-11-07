@@ -1,4 +1,4 @@
-# ksandbox enterprise GA status
+# KSandbox enterprise GA status
 
 Authoritative status board for the enterprise GA objective. Update only from
 live evidence (CI, local collectors, release artifacts, reviewer attestation).

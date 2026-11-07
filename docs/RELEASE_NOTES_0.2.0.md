@@ -1,4 +1,4 @@
-# ksandbox 0.2.0
+# KSandbox 0.2.0
 
 ## Highlights
 

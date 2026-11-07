@@ -1,6 +1,6 @@
-# kbox Sandbox Roadmap
+# KSandbox Roadmap
 
-This document is the authoritative development plan for `ksandbox`.
+This document is the authoritative development plan for KSandbox (`ksandbox`).
 It is derived from first principles, not from cloning Anthropic Sandbox
 Runtime (SRT) APIs or importing a virtual-shell product such as
 `vercel-labs/just-bash`.
@@ -30,7 +30,7 @@ inside this roadmap.
 
 ## Mission
 
-`ksandbox` is the **native Gate 0 command boundary** for kbox products:
+KSandbox (`ksandbox`) is the **native Gate 0 command boundary** for kbox products:
 
 - take an untrusted command string and its descendants;
 - run them only after a workspace / credential / environment / network /
