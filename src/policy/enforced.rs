@@ -1824,17 +1824,19 @@ mod tests {
     }
 
     #[test]
-    fn monorepo_workspace_scan_stays_under_entry_limit() {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let workspace = workspace.canonicalize().unwrap();
+    fn package_workspace_scan_stays_under_entry_limit() {
+        // Standalone repo: scan this package tree (not a parent monorepo).
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let start = std::time::Instant::now();
         let result = EnforcedPolicy::for_execution(&workspace, scratch.path());
         let elapsed = start.elapsed();
         match result {
-            Ok(_) => eprintln!("monorepo_scan_ok elapsed_ms={}", elapsed.as_millis()),
+            Ok(_) => eprintln!("package_scan_ok elapsed_ms={}", elapsed.as_millis()),
             Err(error) => panic!(
-                "monorepo_scan_failed elapsed_ms={}: {error:#}",
+                "package_scan_failed elapsed_ms={}: {error:#}",
                 elapsed.as_millis()
             ),
         }

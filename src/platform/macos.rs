@@ -298,9 +298,11 @@ mod tests {
     }
 
     #[test]
-    fn monorepo_seatbelt_profile_fits_compiled_data_limit() {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let workspace = workspace.canonicalize().unwrap();
+    fn package_seatbelt_profile_fits_compiled_data_limit() {
+        // Standalone repo: scan this package tree (not a parent monorepo).
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap();
         let scratch = tempfile::tempdir().unwrap();
         let policy = EnforcedPolicy::for_execution(&workspace, scratch.path()).unwrap();
         let profile = compile_profile(&policy).unwrap();
