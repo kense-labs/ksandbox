@@ -126,4 +126,24 @@ mod tests {
         let right = normalize_policy_path("./workspace/./src/lib.rs").unwrap();
         assert_eq!(left, right);
     }
+
+    #[test]
+    fn empty_path_and_dot_only_relative_fail() {
+        assert!(normalize_policy_path("").is_err());
+        assert!(normalize_policy_path(".").is_err());
+        assert!(normalize_policy_path("./.").is_err());
+    }
+
+    #[test]
+    fn into_string_and_as_ref_expose_canonical_form() {
+        let normalized = normalize_policy_path("/tmp/./x").unwrap();
+        assert_eq!(normalized.as_ref(), "/tmp/x");
+        assert_eq!(normalized.into_string(), "/tmp/x");
+    }
+
+    #[test]
+    fn absolute_root_only_normalizes() {
+        let normalized = normalize_policy_path("/").unwrap();
+        assert_eq!(normalized.as_str(), "/");
+    }
 }

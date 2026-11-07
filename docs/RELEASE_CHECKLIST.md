@@ -5,6 +5,9 @@ production release. Completing code gates is not enough: independent review and
 signed artifacts are required before mediated network may become a **default**
 profile.
 
+End-to-end scenario catalog (L2/L3 IDs, claim↔evidence, GAP backlog):
+[`E2E_TEST_MATRIX.md`](E2E_TEST_MATRIX.md).
+
 ## Must remain true
 
 Verified by `policy::gate7_release_invariants` plus CI on each OS:
@@ -29,6 +32,9 @@ Verified by `policy::gate7_release_invariants` plus CI on each OS:
 | Mediated HTTP CONNECT | claimed | claimed | claimed |
 | Mediated SOCKS5 | claimed | claimed (live wire proof) | fail-closed |
 | Unix-socket allowlist | claimed | fail-closed | fail-closed |
+
+Row-level E2E IDs and open GAPs for this matrix:
+[`E2E_TEST_MATRIX.md` — Claim ↔ evidence summary](E2E_TEST_MATRIX.md#claim--evidence-summary).
 
 ## Gate 7 assurance artifacts
 

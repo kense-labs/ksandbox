@@ -127,12 +127,31 @@ fn granted_policy_authorizes_only_the_granted_subject() {
 }
 
 /// Full product loop on a mediated-capable host: deny → approve → allow.
-#[cfg(target_os = "macos")]
+/// E2E-GR-01 on every claiming OS (macOS / Linux / Windows).
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::test]
 async fn grant_loop_unblocks_a_denied_command_end_to_end() {
     use crate::CommandRequest;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    #[cfg(target_os = "linux")]
+    use tokio::sync::Mutex;
+
+    #[cfg(target_os = "linux")]
+    static RELAY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    #[cfg(target_os = "linux")]
+    let _relay_guard = RELAY_ENV_LOCK.lock().await;
+    #[cfg(target_os = "linux")]
+    {
+        let test_exe = std::env::current_exe().unwrap();
+        let relay_bin = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|debug| debug.join("ksandbox-relay"))
+            .unwrap();
+        assert!(relay_bin.is_file(), "missing {}", relay_bin.display());
+        std::env::set_var("K_SANDBOX_RELAY", &relay_bin);
+    }
 
     let upstream = TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -148,6 +167,30 @@ async fn grant_loop_unblocks_a_denied_command_end_to_end() {
 
     let workspace = tempfile::tempdir().unwrap();
     let sandbox = NativeSandbox::new(workspace.path()).unwrap();
+
+    #[cfg(windows)]
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$raw = $env:K_SANDBOX_MEDIATOR_PIPE_HANDLE
+if ([string]::IsNullOrEmpty($raw)) {{ throw 'missing mediator pipe (still deny-all?)' }}
+$safe = New-Object Microsoft.Win32.SafeHandles.SafePipeHandle([IntPtr][int64]$raw, $true)
+$client = New-Object System.IO.Pipes.NamedPipeClientStream([System.IO.Pipes.PipeDirection]::InOut, $false, $true, $safe)
+$req = [Text.Encoding]::ASCII.GetBytes("CONNECT 127.0.0.1:{upstream_port} HTTP/1.1`r`nHost: 127.0.0.1`r`n`r`n")
+$client.Write($req, 0, $req.Length)
+$hdr = New-Object byte[] 128
+$n = $client.Read($hdr, 0, $hdr.Length)
+$text = [Text.Encoding]::ASCII.GetString($hdr, 0, $n)
+if ($text -notmatch '200') {{ throw "CONNECT failed: $text" }}
+$ping = [Text.Encoding]::ASCII.GetBytes('ping')
+$client.Write($ping, 0, $ping.Length)
+$pong = New-Object byte[] 4
+[void]$client.Read($pong, 0, 4)
+[Console]::Out.Write([Text.Encoding]::ASCII.GetString($pong))
+$client.Dispose()
+"#
+    );
+    #[cfg(not(windows))]
     let script = format!(
         r#"python3 - <<'PY'
 import os, socket
@@ -175,8 +218,8 @@ PY"#
     let denied = sandbox.execute(request()).await.unwrap();
     assert_ne!(
         denied.exit_code, 0,
-        "baseline must deny network egress; stdout={}",
-        denied.stdout
+        "baseline must deny network egress; stdout={} stderr={}",
+        denied.stdout, denied.stderr
     );
 
     // Step 2: the host approves exactly this origin.
@@ -190,7 +233,13 @@ PY"#
 
     // Step 3: the same command now flows through the mediation boundary.
     let allowed = sandbox.execute(request()).await.unwrap();
-    assert_eq!(allowed.exit_code, 0, "stderr={}", allowed.stderr);
+    #[cfg(target_os = "linux")]
+    std::env::remove_var("K_SANDBOX_RELAY");
+    assert_eq!(
+        allowed.exit_code, 0,
+        "stderr={} stdout={}",
+        allowed.stderr, allowed.stdout
+    );
     assert_eq!(allowed.stdout.trim(), "pong");
     assert!(
         sandbox

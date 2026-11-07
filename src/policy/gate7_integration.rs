@@ -271,6 +271,311 @@ PY"#
     );
 }
 
+/// E2E-HTTP-07: Linux netns fence must scrub hostile proxy env the same way.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gate7_linux_explicit_no_proxy_cannot_bypass_mediator_fence() {
+    use crate::CommandRequest;
+    use std::collections::HashMap;
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    static RELAY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    let _guard = RELAY_ENV_LOCK.lock().await;
+
+    let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    let test_exe = std::env::current_exe().unwrap();
+    let relay_bin = test_exe
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|debug| debug.join("ksandbox-relay"))
+        .unwrap();
+    assert!(relay_bin.is_file(), "missing {}", relay_bin.display());
+    std::env::set_var("K_SANDBOX_RELAY", &relay_bin);
+
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = mediated_http_policy("127.0.0.1", upstream_port);
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+
+    let mut env = HashMap::new();
+    env.insert("NO_PROXY".into(), "*".into());
+    env.insert("no_proxy".into(), "127.0.0.1,localhost".into());
+    env.insert("HTTPS_PROXY".into(), "http://evil.example:9".into());
+
+    let probe = workspace.path().join("gate7_linux_noproxy.py");
+    std::fs::write(
+        &probe,
+        format!(
+            "import os, socket\n\
+assert os.environ.get('NO_PROXY', '') == '', os.environ.get('NO_PROXY')\n\
+assert os.environ.get('no_proxy', '') == '', os.environ.get('no_proxy')\n\
+proxy = os.environ['HTTPS_PROXY']\n\
+assert proxy.startswith('http://127.0.0.1:'), proxy\n\
+port = int(proxy.rsplit(':', 1)[-1])\n\
+s = socket.create_connection(('127.0.0.1', port))\n\
+s.sendall(b'CONNECT 127.0.0.1:{up} HTTP/1.1\\r\\n\\r\\n')\n\
+data = b''\n\
+while b'\\r\\n\\r\\n' not in data:\n\
+\tchunk = s.recv(1)\n\
+\tassert chunk, 'closed'\n\
+\tdata += chunk\n\
+assert data.startswith(b'HTTP/1.1 200'), data\n\
+s.sendall(b'ping')\n\
+assert s.recv(4) == b'pong'\n\
+print('gate7-linux-no-bypass')\n",
+            up = upstream_port
+        ),
+    )
+    .unwrap();
+
+    let output = sandbox
+        .execute(CommandRequest {
+            command: format!("python3 {}", probe.display()),
+            timeout_ms: 30_000,
+            output_observer: None,
+            env: Some(Arc::new(env)),
+        })
+        .await
+        .unwrap();
+    std::env::remove_var("K_SANDBOX_RELAY");
+    assert!(
+        output.stdout.contains("gate7-linux-no-bypass"),
+        "stdout={} stderr={} exit={}",
+        output.stdout,
+        output.stderr,
+        output.exit_code
+    );
+}
+
+/// E2E-HTTP-07: Windows AppContainer path scrubs proxy env; pipe is the bridge.
+#[cfg(windows)]
+#[tokio::test]
+async fn gate7_windows_explicit_no_proxy_cannot_bypass_mediator_fence() {
+    use crate::CommandRequest;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = mediated_http_policy("127.0.0.1", upstream_port);
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+
+    let mut env = HashMap::new();
+    env.insert("NO_PROXY".into(), "*".into());
+    env.insert("no_proxy".into(), "127.0.0.1,localhost".into());
+    env.insert("HTTPS_PROXY".into(), "http://evil.example:9".into());
+    env.insert("HTTP_PROXY".into(), "http://evil.example:9".into());
+
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+if ($env:NO_PROXY) {{ throw "NO_PROXY leaked: $($env:NO_PROXY)" }}
+if ($env:no_proxy) {{ throw "no_proxy leaked: $($env:no_proxy)" }}
+if ($env:HTTPS_PROXY) {{ throw "HTTPS_PROXY leaked: $($env:HTTPS_PROXY)" }}
+if ($env:HTTP_PROXY) {{ throw "HTTP_PROXY leaked: $($env:HTTP_PROXY)" }}
+$raw = $env:K_SANDBOX_MEDIATOR_PIPE_HANDLE
+if ([string]::IsNullOrEmpty($raw)) {{ throw 'missing K_SANDBOX_MEDIATOR_PIPE_HANDLE' }}
+$safe = New-Object Microsoft.Win32.SafeHandles.SafePipeHandle([IntPtr][int64]$raw, $true)
+$client = New-Object System.IO.Pipes.NamedPipeClientStream([System.IO.Pipes.PipeDirection]::InOut, $false, $true, $safe)
+$req = [Text.Encoding]::ASCII.GetBytes("CONNECT 127.0.0.1:{port} HTTP/1.1`r`nHost: 127.0.0.1`r`n`r`n")
+$client.Write($req, 0, $req.Length)
+$hdr = New-Object byte[] 128
+$n = $client.Read($hdr, 0, $hdr.Length)
+$text = [Text.Encoding]::ASCII.GetString($hdr, 0, $n)
+if ($text -notmatch '200') {{ throw "CONNECT allow failed: $text" }}
+$ping = [Text.Encoding]::ASCII.GetBytes('ping')
+$client.Write($ping, 0, $ping.Length)
+$pong = New-Object byte[] 4
+[void]$client.Read($pong, 0, 4)
+if ([Text.Encoding]::ASCII.GetString($pong) -ne 'pong') {{ throw 'bad pong' }}
+try {{
+  $c = New-Object System.Net.Sockets.TcpClient
+  $c.Connect('1.1.1.1', 443)
+  throw 'raw egress unexpectedly allowed'
+}} catch {{
+  if ($_.Exception.Message -match 'unexpectedly') {{ throw }}
+}}
+[Console]::Out.Write('gate7-windows-no-bypass')
+$client.Dispose()
+"#,
+        port = upstream_port
+    );
+
+    let output = sandbox
+        .execute(CommandRequest {
+            command: script,
+            timeout_ms: 30_000,
+            output_observer: None,
+            env: Some(Arc::new(env)),
+        })
+        .await
+        .unwrap();
+    assert!(
+        output.stdout.contains("gate7-windows-no-bypass"),
+        "stdout={} stderr={} exit={}",
+        output.stdout,
+        output.stderr,
+        output.exit_code
+    );
+}
+
+/// E2E-HTTP-08: allowlisted literal IP must not authorize CONNECT to `localhost`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn gate7_guest_connect_does_not_alias_localhost_to_loopback_ip() {
+    use crate::CommandRequest;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    #[cfg(target_os = "linux")]
+    use tokio::sync::Mutex;
+
+    #[cfg(target_os = "linux")]
+    static RELAY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    #[cfg(target_os = "linux")]
+    let _relay_guard = RELAY_ENV_LOCK.lock().await;
+    #[cfg(target_os = "linux")]
+    {
+        let test_exe = std::env::current_exe().unwrap();
+        let relay_bin = test_exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|debug| debug.join("ksandbox-relay"))
+            .unwrap();
+        assert!(relay_bin.is_file(), "missing {}", relay_bin.display());
+        std::env::set_var("K_SANDBOX_RELAY", &relay_bin);
+    }
+
+    let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let accept = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_millis(500), upstream.accept()).await
+    });
+
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = mediated_http_policy("127.0.0.1", upstream_port);
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+
+    let script = format!(
+        r#"python3 - <<'PY'
+import os, socket
+proxy = os.environ["HTTPS_PROXY"].rsplit(":", 1)
+port = int(proxy[-1])
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall(b"CONNECT localhost:{upstream_port} HTTP/1.1\r\n\r\n")
+data = b""
+while b"\r\n\r\n" not in data:
+    chunk = s.recv(1)
+    assert chunk, "closed"
+    data += chunk
+assert not data.startswith(b"HTTP/1.1 200"), data
+print("gate7-no-localhost-alias")
+PY"#
+    );
+    let output = sandbox
+        .execute(CommandRequest {
+            command: script,
+            timeout_ms: 30_000,
+            output_observer: None,
+            env: None,
+        })
+        .await
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    std::env::remove_var("K_SANDBOX_RELAY");
+    assert!(
+        output.stdout.contains("gate7-no-localhost-alias"),
+        "stdout={} stderr={} exit={}",
+        output.stdout,
+        output.stderr,
+        output.exit_code
+    );
+    match accept.await.unwrap() {
+        Err(_) | Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("localhost CONNECT must not reach upstream allowed as 127.0.0.1"),
+    }
+}
+
+/// E2E-OS-L02: missing guest relay binary fails closed (no unsandboxed mediation).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gate7_linux_missing_relay_fails_closed_for_mediation() {
+    use crate::CommandRequest;
+    use tokio::sync::Mutex;
+
+    static RELAY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    let _guard = RELAY_ENV_LOCK.lock().await;
+
+    let missing = tempfile::tempdir()
+        .unwrap()
+        .path()
+        .join("no-such-ksandbox-relay");
+    std::env::set_var("K_SANDBOX_RELAY", &missing);
+
+    let workspace = tempfile::tempdir().unwrap();
+    let policy = mediated_http_policy("127.0.0.1", 9);
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+    let error = sandbox
+        .execute(CommandRequest {
+            command: "true".into(),
+            timeout_ms: 5_000,
+            output_observer: None,
+            env: None,
+        })
+        .await
+        .expect_err("missing relay must fail closed");
+    std::env::remove_var("K_SANDBOX_RELAY");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("relay") || message.contains("K_SANDBOX_RELAY"),
+        "{message}"
+    );
+}
+
+/// E2E-LIFE-05: authoritative missing bwrap override must not fall back to host exec.
+#[cfg(target_os = "linux")]
+#[test]
+fn gate7_linux_missing_bwrap_override_fails_closed() {
+    use std::sync::Mutex;
+    static BWRAP_ENV_LOCK: Mutex<()> = Mutex::new(());
+    let _guard = BWRAP_ENV_LOCK.lock().unwrap();
+
+    let missing = tempfile::tempdir().unwrap().path().join("no-such-bwrap");
+    std::env::set_var("K_SANDBOX_BWRAP_PATH", &missing);
+    let workspace = tempfile::tempdir().unwrap();
+    let error = NativeSandbox::new(workspace.path()).expect_err("missing bwrap must fail closed");
+    std::env::remove_var("K_SANDBOX_BWRAP_PATH");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("bwrap") || message.contains("K_SANDBOX_BWRAP_PATH"),
+        "{message}"
+    );
+}
+
 #[test]
 fn gate7_policy_validate_rejects_malformed_network_hosts() {
     let malformed = [

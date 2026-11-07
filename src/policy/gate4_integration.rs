@@ -1,7 +1,10 @@
 //! Gate 4: mediated HTTP policy shape — fail closed until a real mediator ships.
+//!
+//! Live guest proofs: macOS Seatbelt, Linux netns+relay, Windows AppContainer
+//! named-pipe (via `NativeSandbox`). Platform-private plumbing may also live
+//! under `src/platform/*`; gate4-named tests are the threat-model evidence.
 
 use crate::policy::{BackendCapabilities, NetworkAllowRule, SandboxPolicy, SessionWriteMode};
-#[cfg(not(windows))]
 use crate::NativeSandbox;
 
 #[test]
@@ -298,5 +301,167 @@ fn gate4_does_not_weaken_default_deny_all() {
     assert_eq!(
         policy.filesystem.session_write,
         SessionWriteMode::Persistent
+    );
+}
+
+/// E2E-HTTP-01…03: AppContainer guest CONNECT allow / deny / raw-egress block
+/// through the high-level `NativeSandbox` path (named-pipe inheritance).
+#[cfg(windows)]
+#[tokio::test]
+async fn gate4_windows_sandbox_mediator_tunnels_allow_deny_and_blocks_raw_egress() {
+    use crate::CommandRequest;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (hit_tx, hit_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = upstream.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 4];
+        let _ = sock.read_exact(&mut buf).await;
+        let _ = sock.write_all(b"pong").await;
+        let _ = hit_tx.send(());
+    });
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mut policy = SandboxPolicy::kbash_baseline();
+    policy.features.mediated_network = true;
+    policy.network.allow.push(NetworkAllowRule {
+        host: "127.0.0.1".into(),
+        port: Some(upstream_port),
+        path_prefix: None,
+    });
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+
+    let allow_script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$raw = $env:K_SANDBOX_MEDIATOR_PIPE_HANDLE
+if ([string]::IsNullOrEmpty($raw)) {{ throw 'missing K_SANDBOX_MEDIATOR_PIPE_HANDLE' }}
+$safe = New-Object Microsoft.Win32.SafeHandles.SafePipeHandle([IntPtr][int64]$raw, $true)
+$client = New-Object System.IO.Pipes.NamedPipeClientStream([System.IO.Pipes.PipeDirection]::InOut, $false, $true, $safe)
+$req = [Text.Encoding]::ASCII.GetBytes("CONNECT 127.0.0.1:{port} HTTP/1.1`r`nHost: 127.0.0.1`r`n`r`n")
+$client.Write($req, 0, $req.Length)
+$hdr = New-Object byte[] 128
+$n = $client.Read($hdr, 0, $hdr.Length)
+$text = [Text.Encoding]::ASCII.GetString($hdr, 0, $n)
+if ($text -notmatch '200') {{ throw "CONNECT allow failed: $text" }}
+$ping = [Text.Encoding]::ASCII.GetBytes('ping')
+$client.Write($ping, 0, $ping.Length)
+$pong = New-Object byte[] 4
+[void]$client.Read($pong, 0, 4)
+[Console]::Out.Write([Text.Encoding]::ASCII.GetString($pong))
+$client.Dispose()
+"#,
+        port = upstream_port
+    );
+    let allow = sandbox
+        .execute(CommandRequest {
+            command: allow_script,
+            timeout_ms: 30_000,
+            output_observer: None,
+            env: None,
+        })
+        .await
+        .expect("allow execute");
+    assert_eq!(
+        allow.exit_code, 0,
+        "allow stderr={} stdout={}",
+        allow.stderr, allow.stdout
+    );
+    assert!(
+        allow.stdout.contains("pong"),
+        "allow stdout={}",
+        allow.stdout
+    );
+    hit_rx
+        .await
+        .expect("allowed CONNECT must reach upstream once");
+
+    let deny_upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let deny_port = deny_upstream.local_addr().unwrap().port();
+    let deny_accept = tokio::spawn(async move {
+        tokio::time::timeout(
+            std::time::Duration::from_millis(400),
+            deny_upstream.accept(),
+        )
+        .await
+    });
+    let deny_script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$raw = $env:K_SANDBOX_MEDIATOR_PIPE_HANDLE
+$safe = New-Object Microsoft.Win32.SafeHandles.SafePipeHandle([IntPtr][int64]$raw, $true)
+$client = New-Object System.IO.Pipes.NamedPipeClientStream([System.IO.Pipes.PipeDirection]::InOut, $false, $true, $safe)
+$req = [Text.Encoding]::ASCII.GetBytes("CONNECT 127.0.0.1:{port} HTTP/1.1`r`nHost: 127.0.0.1`r`n`r`n")
+$client.Write($req, 0, $req.Length)
+$hdr = New-Object byte[] 128
+$n = $client.Read($hdr, 0, $hdr.Length)
+$text = [Text.Encoding]::ASCII.GetString($hdr, 0, $n)
+if ($text -match '200') {{ throw 'denied CONNECT unexpectedly succeeded' }}
+[Console]::Out.Write('deny-ok')
+$client.Dispose()
+"#,
+        port = deny_port
+    );
+    let deny = sandbox
+        .execute(CommandRequest {
+            command: deny_script,
+            timeout_ms: 30_000,
+            output_observer: None,
+            env: None,
+        })
+        .await
+        .expect("deny execute");
+    assert_eq!(
+        deny.exit_code, 0,
+        "deny stderr={} stdout={}",
+        deny.stderr, deny.stdout
+    );
+    assert!(
+        deny.stdout.contains("deny-ok"),
+        "deny stdout={}",
+        deny.stdout
+    );
+    match deny_accept.await.unwrap() {
+        Err(_) | Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("denied CONNECT must not reach upstream"),
+    }
+
+    let egress = sandbox
+        .execute(CommandRequest {
+            command: format!(
+                r#"
+$ErrorActionPreference = 'Stop'
+try {{
+  $c = New-Object System.Net.Sockets.TcpClient
+  $c.Connect('127.0.0.1', {port})
+  throw 'raw egress unexpectedly allowed'
+}} catch {{
+  if ($_.Exception.Message -match 'unexpectedly') {{ throw }}
+}}
+[Console]::Out.Write('raw-blocked')
+"#,
+                port = upstream_port
+            ),
+            timeout_ms: 15_000,
+            output_observer: None,
+            env: None,
+        })
+        .await
+        .expect("raw egress execute");
+    assert_eq!(
+        egress.exit_code, 0,
+        "raw stderr={} stdout={}",
+        egress.stderr, egress.stdout
+    );
+    assert!(
+        egress.stdout.contains("raw-blocked"),
+        "raw stdout={}",
+        egress.stdout
     );
 }

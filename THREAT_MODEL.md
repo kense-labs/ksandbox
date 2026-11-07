@@ -101,6 +101,12 @@ When mediation is enabled on a claiming OS:
 ## Review checklist (before defaulting mediation)
 
 1. Live bypass suite on each claiming OS (proxy env, DNS literal swap, FD leak)
+   — see E2E-HTTP-07 / E2E-HTTP-08 in the matrix
 2. Soak under concurrent workspaces
 3. SBOM + vulnerability scan of release artifacts
 4. Independent review of mediator and platform fences
+
+Scenario IDs, platform coverage, and GAP/RESIDUAL tracking live in
+[`docs/E2E_TEST_MATRIX.md`](docs/E2E_TEST_MATRIX.md). Every claimed row in the
+tables above must keep a live L2 evidence pointer there before mediation may
+become a default profile.

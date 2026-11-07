@@ -11,9 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(not(windows))]
-use crate::policy::SecretHeaderInjection;
-use crate::policy::{AccessDecision, NetworkAllowRule, SandboxPolicy};
+use crate::policy::{AccessDecision, NetworkAllowRule, SandboxPolicy, SecretHeaderInjection};
 use crate::{AuditSurface, CommandRequest, NativeSandbox, ReasonCode, SECRET_ENV_SENTINEL_PREFIX};
 
 const SECRET_NAME: &str = "ASTER_GATE8_TOKEN";
@@ -287,9 +285,18 @@ async fn gate8_secret_bytes_absent_from_audit_and_digest_stable() {
 
 // -- Gate 8 slice 2: egress re-injection at the mediation point --------------
 
-#[cfg(not(windows))]
-#[tokio::test]
-async fn gate8_egress_reinjection_delivers_secret_without_landing_it() {
+fn mediated_policy_for_port(port: u16) -> SandboxPolicy {
+    let mut policy = SandboxPolicy::kbash_baseline();
+    policy.features.mediated_network = true;
+    policy.network.allow.push(NetworkAllowRule {
+        host: "127.0.0.1".into(),
+        port: Some(port),
+        path_prefix: None,
+    });
+    policy
+}
+
+async fn spawn_injection_upstream_async() -> (u16, tokio::task::JoinHandle<String>) {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -315,7 +322,7 @@ async fn gate8_egress_reinjection_delivers_secret_without_landing_it() {
             "upstream must observe the injected secret: {head:?}"
         );
         assert!(
-            !head.contains("kbox:secret:"),
+            !head.contains("kbox:secret:") && !head.contains("krun:secret:"),
             "sentinels must never be forwarded upstream: {head:?}"
         );
         stream
@@ -324,6 +331,13 @@ async fn gate8_egress_reinjection_delivers_secret_without_landing_it() {
             .unwrap();
         head
     });
+    (upstream_port, upstream_task)
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn gate8_egress_reinjection_delivers_secret_without_landing_it() {
+    let (upstream_port, upstream_task) = spawn_injection_upstream_async().await;
 
     let workspace = tempfile::tempdir().unwrap();
     let mut policy = mediated_policy_for_port(upstream_port);
@@ -385,14 +399,78 @@ PY"#
     upstream_task.await.unwrap();
 }
 
-#[cfg(not(windows))]
-fn mediated_policy_for_port(port: u16) -> SandboxPolicy {
-    let mut policy = SandboxPolicy::kbash_baseline();
-    policy.features.mediated_network = true;
-    policy.network.allow.push(NetworkAllowRule {
+/// E2E-SEC-03: Windows AppContainer reinjection via named-pipe absolute-form HTTP.
+#[cfg(windows)]
+#[tokio::test]
+async fn gate8_windows_egress_reinjection_delivers_secret_without_landing_it() {
+    let (upstream_port, upstream_task) = spawn_injection_upstream_async().await;
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mut policy = mediated_policy_for_port(upstream_port);
+    policy.secret_injections.push(SecretHeaderInjection {
         host: "127.0.0.1".into(),
-        port: Some(port),
-        path_prefix: None,
+        port: Some(upstream_port),
+        path_prefix: Some("/v1".into()),
+        header: "Authorization".into(),
+        value_prefix: "Bearer ".into(),
+        secret_env: SECRET_NAME.into(),
     });
-    policy
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+
+    let script = format!(
+        r#"
+$ErrorActionPreference = 'Stop'
+$raw = $env:K_SANDBOX_MEDIATOR_PIPE_HANDLE
+if ([string]::IsNullOrEmpty($raw)) {{ throw 'missing K_SANDBOX_MEDIATOR_PIPE_HANDLE' }}
+if ($env:ASTER_GATE8_TOKEN -notlike 'kbox:secret:*' -and $env:ASTER_GATE8_TOKEN -notlike 'krun:secret:*') {{
+  if ($env:ASTER_GATE8_TOKEN -eq '{secret}') {{ throw 'secret landed in guest env' }}
+}}
+$safe = New-Object Microsoft.Win32.SafeHandles.SafePipeHandle([IntPtr][int64]$raw, $true)
+$client = New-Object System.IO.Pipes.NamedPipeClientStream([System.IO.Pipes.PipeDirection]::InOut, $false, $true, $safe)
+$req = [Text.Encoding]::ASCII.GetBytes("GET http://127.0.0.1:{port}/v1/token HTTP/1.1`r`nAccept: */*`r`n`r`n")
+$client.Write($req, 0, $req.Length)
+$buf = New-Object byte[] 4096
+$n = $client.Read($buf, 0, $buf.Length)
+$text = [Text.Encoding]::ASCII.GetString($buf, 0, $n)
+if ($text -notmatch 'token-ok') {{ throw "unexpected response: $text" }}
+if ($text -match [regex]::Escape('{secret}')) {{ throw 'secret leaked into guest response' }}
+[Console]::Out.Write('token-ok')
+$client.Dispose()
+"#,
+        port = upstream_port,
+        secret = SECRET_VALUE
+    );
+
+    let output = sandbox
+        .execute_with_secrets(
+            CommandRequest {
+                command: script,
+                timeout_ms: 30_000,
+                output_observer: None,
+                env: None,
+            },
+            secret_map(SECRET_NAME, SECRET_VALUE),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        output.exit_code, 0,
+        "stderr={} stdout={}",
+        output.stderr, output.stdout
+    );
+    assert!(
+        output.stdout.contains("token-ok"),
+        "stdout={} stderr={}",
+        output.stdout,
+        output.stderr
+    );
+    assert!(
+        !output.stdout.contains(SECRET_VALUE) && !output.stderr.contains(SECRET_VALUE),
+        "secret bytes must not appear in guest-visible output"
+    );
+    assert!(
+        !format!("{:?}", sandbox.audit_log().snapshot()).contains(SECRET_VALUE),
+        "secret bytes must never reach the audit log"
+    );
+    upstream_task.await.unwrap();
 }

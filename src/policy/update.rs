@@ -205,4 +205,108 @@ mod tests {
             .to_string();
         assert!(error.contains("max_processes"), "{error}");
     }
+
+    #[test]
+    fn adding_filesystem_allows_and_removing_denies_is_broadening() {
+        let current = SandboxPolicy::kbash_baseline();
+        let mut next = current.clone();
+        next.filesystem
+            .allow_read
+            .push(PathRule::Exact("/extra/read".into()));
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("allow_read"));
+
+        next = current.clone();
+        next.filesystem
+            .allow_write
+            .push(PathRule::Exact("/extra/write".into()));
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("allow_write"));
+
+        let mut with_deny = current.clone();
+        with_deny
+            .filesystem
+            .deny_read
+            .push(PathRule::Exact("/secret".into()));
+        let narrowed_deny = current.clone();
+        assert!(ensure_policy_not_broader(&with_deny, &narrowed_deny)
+            .unwrap_err()
+            .to_string()
+            .contains("deny_read"));
+
+        with_deny = current.clone();
+        with_deny
+            .filesystem
+            .deny_write
+            .push(PathRule::Exact("/secret".into()));
+        assert!(ensure_policy_not_broader(&with_deny, &current)
+            .unwrap_err()
+            .to_string()
+            .contains("deny_write"));
+    }
+
+    #[test]
+    fn mounts_session_write_and_resource_raises_are_broadening() {
+        use crate::policy::{FilesystemMount, MountMode};
+
+        let mut current = SandboxPolicy::kbash_baseline();
+        current.filesystem.session_write = SessionWriteMode::Ephemeral;
+        let mut next = current.clone();
+        next.filesystem.session_write = SessionWriteMode::Persistent;
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("session_write"));
+
+        current = SandboxPolicy::kbash_baseline();
+        next = current.clone();
+        next.filesystem.mounts.push(FilesystemMount {
+            root: PathRule::Exact("/usr/share/doc".into()),
+            mode: MountMode::ReadOnly,
+        });
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("filesystem.mounts"));
+
+        current = SandboxPolicy::kbash_baseline();
+        current.resources.max_output_bytes = 1024;
+        next = current.clone();
+        next.resources.max_output_bytes = 2048;
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("max_output_bytes"));
+
+        current = SandboxPolicy::kbash_baseline();
+        current.resources.max_memory_bytes = Some(1024);
+        next = current.clone();
+        next.resources.max_memory_bytes = Some(2048);
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("max_memory_bytes"));
+
+        current = SandboxPolicy::kbash_baseline();
+        current.resources.max_call_depth = Some(2);
+        next = current.clone();
+        next.resources.max_call_depth = Some(4);
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("max_call_depth"));
+
+        current = SandboxPolicy::kbash_baseline();
+        current.resources.max_memory_bytes = Some(1024);
+        next = current.clone();
+        next.resources.max_memory_bytes = None;
+        assert!(ensure_policy_not_broader(&current, &next)
+            .unwrap_err()
+            .to_string()
+            .contains("max_memory_bytes"));
+    }
 }

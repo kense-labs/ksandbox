@@ -208,4 +208,89 @@ mod tests {
             assert!(error.contains("process limit"), "{error}");
         }
     }
+
+    #[test]
+    fn resolve_rejects_zero_timeouts_and_output() {
+        let policy = ResourceLimits::default();
+        assert!(ResolvedResourceBudget::resolve(&policy, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("command timeout"));
+        let policy = ResourceLimits {
+            timeout_ms: 0,
+            ..ResourceLimits::default()
+        };
+        assert!(ResolvedResourceBudget::resolve(&policy, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("timeout_ms"));
+        let policy = ResourceLimits {
+            max_output_bytes: 0,
+            ..ResourceLimits::default()
+        };
+        assert!(ResolvedResourceBudget::resolve(&policy, 1_000)
+            .unwrap_err()
+            .to_string()
+            .contains("max_output_bytes"));
+    }
+
+    #[test]
+    fn validate_for_backend_requires_timeout_and_output_caps() {
+        let budget = ResolvedResourceBudget::resolve(&ResourceLimits::default(), 1_000).unwrap();
+        let no_timeout = BackendCapabilities {
+            resource_timeout: false,
+            ..BackendCapabilities::native_gate2()
+        };
+        assert!(budget
+            .validate_for_backend(no_timeout)
+            .unwrap_err()
+            .to_string()
+            .contains("timeouts"));
+        let no_output = BackendCapabilities {
+            resource_output_limit: false,
+            ..BackendCapabilities::native_gate2()
+        };
+        assert!(budget
+            .validate_for_backend(no_output)
+            .unwrap_err()
+            .to_string()
+            .contains("output"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_unix_rlimits_fails_closed_for_process_and_non_linux_memory() {
+        let with_proc = ResolvedResourceBudget {
+            timeout_ms: 1_000,
+            max_output_bytes: 1024,
+            max_processes: Some(4),
+            max_memory_bytes: None,
+        };
+        assert!(apply_unix_rlimits(&with_proc)
+            .unwrap_err()
+            .to_string()
+            .contains("process limit"));
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let with_mem = ResolvedResourceBudget {
+                timeout_ms: 1_000,
+                max_output_bytes: 1024,
+                max_processes: None,
+                max_memory_bytes: Some(64 * 1024 * 1024),
+            };
+            assert!(apply_unix_rlimits(&with_mem)
+                .unwrap_err()
+                .to_string()
+                .contains("memory limit"));
+        }
+
+        let empty = ResolvedResourceBudget {
+            timeout_ms: 1_000,
+            max_output_bytes: 1024,
+            max_processes: None,
+            max_memory_bytes: None,
+        };
+        apply_unix_rlimits(&empty).unwrap();
+    }
 }

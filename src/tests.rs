@@ -626,7 +626,11 @@ if ($unixAllowed) {{ throw 'host Unix socket creation unexpectedly succeeded' }}
 
     #[cfg(not(windows))]
     let probes = [
+        // E2E-NET-01
         "python3 -c 'import socket; s=socket.socket(); s.bind((\"127.0.0.1\", 0))'",
+        // E2E-NET-02
+        "python3 -c 'import socket; s=socket.socket(socket.AF_INET6); s.bind((\"::1\", 0))'",
+        // E2E-NET-03
         "python3 -c 'import socket; s=socket.socket(socket.AF_UNIX); s.bind(\"blocked.sock\")'",
     ];
 

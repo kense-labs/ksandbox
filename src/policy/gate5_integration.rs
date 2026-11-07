@@ -1,7 +1,7 @@
 //! Gate 5: Unix-domain socket allowlists and SOCKS5 mediation.
 
 use crate::policy::{BackendCapabilities, NetworkAllowRule, PathRule, SandboxPolicy};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::NativeSandbox;
 
 #[test]
@@ -297,4 +297,184 @@ PY"#
         output.stderr,
         output.exit_code
     );
+}
+
+/// E2E-SOCKS-01: Linux netns + guest relay SOCKS5 allow tunnel (gate5-named evidence).
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gate5_linux_sandbox_socks_tunnels_allowed_connect() {
+    use crate::CommandRequest;
+    use std::net::SocketAddr;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    static RELAY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    let _guard = RELAY_ENV_LOCK.lock().await;
+
+    let upstream = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let mut buf = [0u8; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        stream.write_all(b"pong").await.unwrap();
+    });
+
+    let test_exe = std::env::current_exe().unwrap();
+    let relay_bin = test_exe
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|debug| debug.join("ksandbox-relay"))
+        .unwrap();
+    assert!(relay_bin.is_file(), "missing {}", relay_bin.display());
+    std::env::set_var("K_SANDBOX_RELAY", &relay_bin);
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mut policy = SandboxPolicy::kbash_baseline();
+    policy.features.mediated_socks = true;
+    policy.network.allow.push(NetworkAllowRule {
+        host: "127.0.0.1".into(),
+        port: Some(upstream_port),
+        path_prefix: None,
+    });
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+
+    let probe = workspace.path().join("gate5_linux_socks.py");
+    std::fs::write(
+        &probe,
+        format!(
+            "import os, socket, struct\n\
+proxy = os.environ['ALL_PROXY']\n\
+assert proxy.startswith('socks5://'), proxy\n\
+port = int(proxy.rsplit(':', 1)[-1])\n\
+s = socket.create_connection(('127.0.0.1', port))\n\
+s.sendall(b'\\x05\\x01\\x00')\n\
+assert s.recv(2) == b'\\x05\\x00'\n\
+host = b'127.0.0.1'\n\
+req = b'\\x05\\x01\\x00\\x03' + bytes([len(host)]) + host + struct.pack('!H', {up})\n\
+s.sendall(req)\n\
+reply = s.recv(10)\n\
+assert reply[1] == 0, reply\n\
+s.sendall(b'ping')\n\
+assert s.recv(4) == b'pong'\n\
+print('gate5-linux-socks-ok')\n",
+            up = upstream_port
+        ),
+    )
+    .unwrap();
+
+    let output = sandbox
+        .execute(CommandRequest {
+            command: format!("python3 {}", probe.display()),
+            timeout_ms: 30_000,
+            output_observer: None,
+            env: None,
+        })
+        .await
+        .unwrap();
+    std::env::remove_var("K_SANDBOX_RELAY");
+    assert!(
+        output.stdout.contains("gate5-linux-socks-ok"),
+        "stdout={} stderr={} exit={}",
+        output.stdout,
+        output.stderr,
+        output.exit_code
+    );
+}
+
+/// E2E-SOCKS-02/03: denied SOCKS target + raw egress stay closed on Linux.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn gate5_linux_sandbox_socks_denies_forbidden_and_blocks_raw_egress() {
+    use crate::CommandRequest;
+    use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex;
+
+    static RELAY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+    let _guard = RELAY_ENV_LOCK.lock().await;
+
+    let forbidden = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .unwrap();
+    let forbidden_port = forbidden.local_addr().unwrap().port();
+    let accept = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_millis(400), forbidden.accept()).await
+    });
+
+    let test_exe = std::env::current_exe().unwrap();
+    let relay_bin = test_exe
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|debug| debug.join("ksandbox-relay"))
+        .unwrap();
+    assert!(relay_bin.is_file(), "missing {}", relay_bin.display());
+    std::env::set_var("K_SANDBOX_RELAY", &relay_bin);
+
+    let workspace = tempfile::tempdir().unwrap();
+    let mut policy = SandboxPolicy::kbash_baseline();
+    policy.features.mediated_socks = true;
+    policy.network.allow.push(NetworkAllowRule {
+        host: "allowed.example".into(),
+        port: Some(9),
+        path_prefix: None,
+    });
+    let sandbox = NativeSandbox::with_policy(workspace.path(), policy).unwrap();
+
+    let probe = workspace.path().join("gate5_linux_socks_deny.py");
+    std::fs::write(
+        &probe,
+        format!(
+            "import os, socket, struct\n\
+proxy = os.environ['ALL_PROXY']\n\
+port = int(proxy.rsplit(':', 1)[-1])\n\
+s = socket.create_connection(('127.0.0.1', port))\n\
+s.sendall(b'\\x05\\x01\\x00')\n\
+assert s.recv(2) == b'\\x05\\x00'\n\
+host = b'127.0.0.1'\n\
+req = b'\\x05\\x01\\x00\\x03' + bytes([len(host)]) + host + struct.pack('!H', {up})\n\
+s.sendall(req)\n\
+reply = s.recv(10)\n\
+assert reply[1] != 0, reply\n\
+# Raw TCP to the forbidden port must also fail inside the netns.\n\
+raw = socket.socket()\n\
+raw.settimeout(0.5)\n\
+try:\n\
+\traw.connect(('127.0.0.1', {up}))\n\
+\traise SystemExit('raw egress unexpectedly allowed')\n\
+except OSError:\n\
+\tpass\n\
+finally:\n\
+\traw.close()\n\
+print('gate5-linux-socks-deny-ok')\n",
+            up = forbidden_port
+        ),
+    )
+    .unwrap();
+
+    let output = sandbox
+        .execute(CommandRequest {
+            command: format!("python3 {}", probe.display()),
+            timeout_ms: 30_000,
+            output_observer: None,
+            env: None,
+        })
+        .await
+        .unwrap();
+    std::env::remove_var("K_SANDBOX_RELAY");
+    assert!(
+        output.stdout.contains("gate5-linux-socks-deny-ok"),
+        "stdout={} stderr={} exit={}",
+        output.stdout,
+        output.stderr,
+        output.exit_code
+    );
+    match accept.await.unwrap() {
+        Err(_) | Ok(Err(_)) => {}
+        Ok(Ok(_)) => panic!("denied SOCKS must not reach upstream"),
+    }
 }
