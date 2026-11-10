@@ -2,7 +2,7 @@
 
 use crate::policy::{path_ancestors, resolve_executable, EnforcedPolicy, ResolvedResourceBudget};
 use crate::process::run_tokio_command;
-use crate::{CommandOutput, CommandRequest};
+use crate::{Cancellation, CommandOutput, CommandRequest, CommandTermination};
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -34,7 +34,8 @@ impl PlatformSandbox {
         &self,
         policy: &EnforcedPolicy,
         request: CommandRequest,
-    ) -> Result<CommandOutput> {
+        cancellation: Option<Cancellation<'_>>,
+    ) -> Result<(CommandOutput, CommandTermination)> {
         let profile = compile_profile(policy)?;
         let profile_path = policy.scratch.join("seatbelt.sb");
         tokio::fs::write(&profile_path, profile)
@@ -66,7 +67,14 @@ impl PlatformSandbox {
             .current_dir(&policy.workspace)
             .env_clear();
 
-        run_tokio_command(command, request, &budget, "macOS native sandbox command").await
+        run_tokio_command(
+            command,
+            request,
+            &budget,
+            cancellation,
+            "macOS native sandbox command",
+        )
+        .await
     }
 }
 

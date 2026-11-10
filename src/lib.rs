@@ -8,7 +8,9 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 mod network;
@@ -115,6 +117,16 @@ pub struct CommandOutput {
     pub exit_code: i32,
     pub timed_out: bool,
 }
+
+/// How an original command reached its observed terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandTermination {
+    Completed,
+    TimedOut,
+    Cancelled,
+}
+
+pub(crate) type Cancellation<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 /// A fail-closed native sandbox bound to one canonical workspace.
 ///
@@ -386,7 +398,27 @@ impl NativeSandbox {
 
     /// Execute a command inside the configured native boundary.
     pub async fn execute(&self, request: CommandRequest) -> Result<CommandOutput> {
-        self.execute_inner(request, new_command_id(), None).await
+        self.execute_inner(request, new_command_id(), None, None)
+            .await
+            .map(|(output, _)| output)
+    }
+
+    /// Cancel through the existing process owner and observe the original exit.
+    ///
+    /// Cleanup or wait failures remain errors. Dropping this future retains the
+    /// existing kill-on-drop behavior without inventing a cancellation receipt.
+    pub async fn execute_cancellable(
+        &self,
+        request: CommandRequest,
+        cancellation: impl Future<Output = ()> + Send,
+    ) -> Result<(CommandOutput, CommandTermination)> {
+        self.execute_inner(
+            request,
+            new_command_id(),
+            None,
+            Some(Box::pin(cancellation)),
+        )
+        .await
     }
 
     /// Execute a command with host-held secret environment entries.
@@ -405,7 +437,10 @@ impl NativeSandbox {
     ) -> Result<CommandOutput> {
         let command_id = new_command_id();
         let Some(secrets) = secrets.filter(|map| !map.is_empty()) else {
-            return self.execute_inner(request, command_id, None).await;
+            return self
+                .execute_inner(request, command_id, None, None)
+                .await
+                .map(|(output, _)| output);
         };
         if !read_policy(&self.policy).features.mediated_network {
             self.audit.record(AuditEvent::from_parts(AuditEventParts {
@@ -478,7 +513,9 @@ impl NativeSandbox {
             reason_code: ReasonCode::PolicyAllow,
             target_redacted: format!("<secret-env:{}>", names.join(",")),
         }));
-        self.execute_inner(request, command_id, Some(secrets)).await
+        self.execute_inner(request, command_id, Some(secrets), None)
+            .await
+            .map(|(output, _)| output)
     }
 
     async fn execute_inner(
@@ -486,7 +523,8 @@ impl NativeSandbox {
         request: CommandRequest,
         command_id: String,
         secrets: Option<Arc<HashMap<String, String>>>,
-    ) -> Result<CommandOutput> {
+        cancellation: Option<Cancellation<'_>>,
+    ) -> Result<(CommandOutput, CommandTermination)> {
         if request.timeout_ms == 0 {
             bail!("native sandbox command timeout must be greater than zero");
         }
@@ -654,20 +692,24 @@ impl NativeSandbox {
                 return Err(error);
             }
         };
-        let output = {
+        let (output, termination) = {
             #[cfg(windows)]
             {
                 if let Some(client) = mediator_pipe_client {
                     self.platform
-                        .execute_with_mediator_client(&policy, request, client)
+                        .execute_with_mediator_client(&policy, request, client, cancellation)
                         .await?
                 } else {
-                    self.platform.execute(&policy, request).await?
+                    self.platform
+                        .execute(&policy, request, cancellation)
+                        .await?
                 }
             }
             #[cfg(not(windows))]
             {
-                self.platform.execute(&policy, request).await?
+                self.platform
+                    .execute(&policy, request, cancellation)
+                    .await?
             }
         };
         if let Some(handle) = http_mediator {
@@ -688,7 +730,7 @@ impl NativeSandbox {
                 target_redacted: "<process-tree>".into(),
             }));
         }
-        Ok(output)
+        Ok((output, termination))
     }
 }
 

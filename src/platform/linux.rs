@@ -5,7 +5,7 @@ use crate::policy::{
     ResolvedResourceBudget,
 };
 use crate::process::run_tokio_command;
-use crate::{CommandOutput, CommandRequest};
+use crate::{Cancellation, CommandOutput, CommandRequest, CommandTermination};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -45,7 +45,8 @@ impl PlatformSandbox {
         &self,
         policy: &EnforcedPolicy,
         request: CommandRequest,
-    ) -> Result<CommandOutput> {
+        cancellation: Option<Cancellation<'_>>,
+    ) -> Result<(CommandOutput, CommandTermination)> {
         let _pins = WorkspacePins::acquire(policy)?;
         let budget = ResolvedResourceBudget::resolve(&policy.resources, request.timeout_ms)?;
         budget.validate_for_backend(crate::policy::BackendCapabilities::native_gate2())?;
@@ -100,7 +101,14 @@ impl PlatformSandbox {
             .current_dir(&policy.workspace)
             .env_clear();
 
-        run_tokio_command(command, request, &budget, "Linux native sandbox command").await
+        run_tokio_command(
+            command,
+            request,
+            &budget,
+            cancellation,
+            "Linux native sandbox command",
+        )
+        .await
     }
 }
 

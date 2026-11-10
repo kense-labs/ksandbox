@@ -7,7 +7,7 @@ use super::windows_shell::{build_powershell_command, encode_powershell_command};
 use crate::policy::{
     requires_directory_placeholder, resolve_executable, EnforcedPolicy, ResolvedResourceBudget,
 };
-use crate::{CommandOutput, CommandRequest};
+use crate::{Cancellation, CommandOutput, CommandRequest, CommandTermination};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::ffi::{c_void, OsStr, OsString};
@@ -96,8 +96,10 @@ impl PlatformSandbox {
         &self,
         policy: &EnforcedPolicy,
         request: CommandRequest,
-    ) -> Result<CommandOutput> {
-        self.execute_inner(policy, request, None).await
+        cancellation: Option<Cancellation<'_>>,
+    ) -> Result<(CommandOutput, CommandTermination)> {
+        self.execute_inner(policy, request, None, cancellation)
+            .await
     }
 
     /// Execute with an inherited, already-connected mediation pipe client handle.
@@ -106,8 +108,9 @@ impl PlatformSandbox {
         policy: &EnforcedPolicy,
         request: CommandRequest,
         mediator_client: OwnedHandle,
-    ) -> Result<CommandOutput> {
-        self.execute_inner(policy, request, Some(mediator_client))
+        cancellation: Option<Cancellation<'_>>,
+    ) -> Result<(CommandOutput, CommandTermination)> {
+        self.execute_inner(policy, request, Some(mediator_client), cancellation)
             .await
     }
 
@@ -116,7 +119,8 @@ impl PlatformSandbox {
         policy: &EnforcedPolicy,
         request: CommandRequest,
         mediator_client: Option<OwnedHandle>,
-    ) -> Result<CommandOutput> {
+        cancellation: Option<Cancellation<'_>>,
+    ) -> Result<(CommandOutput, CommandTermination)> {
         // Workspace DACLs are restored after each command. Serialize per
         // workspace so apply/use/restore cannot race. Ancestor ACL mutations
         // (Temp/home traverse) are globally serialized so concurrent workspaces
@@ -150,7 +154,7 @@ impl PlatformSandbox {
                     &budget,
                     mediator_client,
                 ) {
-                    Ok(child) => capture_process(child, request, &budget).await,
+                    Ok(child) => capture_process(child, request, &budget, cancellation).await,
                     Err(error) => Err(error),
                 }
             }
@@ -191,10 +195,7 @@ fn acl_mutation_gate() -> &'static Mutex<()> {
     GATE.get_or_init(|| Mutex::new(()))
 }
 
-fn finish_execution(
-    execution: Result<CommandOutput>,
-    acl_cleanup: Result<()>,
-) -> Result<CommandOutput> {
+fn finish_execution<T>(execution: Result<T>, acl_cleanup: Result<()>) -> Result<T> {
     match (execution, acl_cleanup) {
         (Ok(output), Ok(())) => Ok(output),
         (Ok(_), Err(error)) => Err(error),
@@ -418,9 +419,15 @@ impl JobGuard {
     }
 
     fn terminate(&self) {
-        unsafe {
-            TerminateJobObject(self.raw(), 1);
+        let _ = self.try_terminate();
+    }
+
+    fn try_terminate(&self) -> Result<()> {
+        // SAFETY: this live handle owns the Job Object and its child processes.
+        if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
+            return Err(last_windows_error("terminate native sandbox Job Object"));
         }
+        Ok(())
     }
 }
 
@@ -751,7 +758,8 @@ async fn capture_process(
     child: WindowsChild,
     request: CommandRequest,
     budget: &ResolvedResourceBudget,
-) -> Result<CommandOutput> {
+    cancellation: Option<Cancellation<'_>>,
+) -> Result<(CommandOutput, CommandTermination)> {
     use crate::process::{BoundedCapture, OutputStream};
 
     let WindowsChild {
@@ -777,9 +785,17 @@ async fn capture_process(
     let mut stderr_done = false;
     let mut process_done = false;
     let mut timed_out = false;
+    let mut cancelled = false;
     let mut capture = BoundedCapture::new(budget.max_output_bytes);
     let deadline = tokio::time::sleep(tokio::time::Duration::from_millis(budget.timeout_ms));
     tokio::pin!(deadline);
+    let cancel = async {
+        match cancellation {
+            Some(cancellation) => cancellation.await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cancel);
     let settlement = tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60));
     tokio::pin!(settlement);
     let mut settlement_active = false;
@@ -827,7 +843,28 @@ async fn capture_process(
                     settlement_active = true;
                 }
             }
-            _ = &mut deadline, if !timed_out => {
+            _ = &mut cancel, if !cancelled && !timed_out => {
+                cancelled = true;
+                job.try_terminate()?;
+                if !process_done {
+                    tokio::time::timeout(
+                        tokio::time::Duration::from_millis(PIPE_SETTLEMENT_MS),
+                        &mut wait,
+                    )
+                    .await
+                    .context("cancelled AppContainer cleanup did not settle")?
+                    .context("cancelled AppContainer wait task failed")??;
+                    process_done = true;
+                }
+                if !settlement_active {
+                    settlement.as_mut().reset(
+                        tokio::time::Instant::now()
+                            + tokio::time::Duration::from_millis(PIPE_SETTLEMENT_MS),
+                    );
+                    settlement_active = true;
+                }
+            }
+            _ = &mut deadline, if !timed_out && !cancelled => {
                 timed_out = true;
                 job.terminate();
                 if !settlement_active {
@@ -863,12 +900,22 @@ async fn capture_process(
     };
     drop(job);
     workspace_drive.remove()?;
-    Ok(CommandOutput {
-        stdout: capture.render_stream(OutputStream::Stdout),
-        stderr: capture.render_stream(OutputStream::Stderr),
-        exit_code,
-        timed_out,
-    })
+    let termination = if cancelled {
+        CommandTermination::Cancelled
+    } else if timed_out {
+        CommandTermination::TimedOut
+    } else {
+        CommandTermination::Completed
+    };
+    Ok((
+        CommandOutput {
+            stdout: capture.render_stream(OutputStream::Stdout),
+            stderr: capture.render_stream(OutputStream::Stderr),
+            exit_code,
+            timed_out,
+        },
+        termination,
+    ))
 }
 
 enum PipePoll {

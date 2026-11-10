@@ -4,7 +4,7 @@ use crate::OutputSummary;
 #[cfg(test)]
 use crate::MAX_OUTPUT_SIZE;
 #[cfg(unix)]
-use crate::{CommandOutput, CommandRequest, OutputObserver};
+use crate::{Cancellation, CommandOutput, CommandRequest, CommandTermination, OutputObserver};
 #[cfg(unix)]
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
@@ -167,6 +167,7 @@ pub(crate) struct CapturedProcessOutput {
     pub(crate) stderr: String,
     pub(crate) status: Option<ExitStatus>,
     pub(crate) timed_out: bool,
+    pub(crate) cancelled: bool,
 }
 
 /// Configure a child as the leader of its own process group when supported.
@@ -194,13 +195,23 @@ impl ProcessGroupGuard {
     }
 
     pub(crate) fn kill(&mut self) {
+        let _ = self.try_kill();
+    }
+
+    fn try_kill(&mut self) -> io::Result<()> {
         if let Some(process_group) = self.process_group.take() {
             // A negative PID addresses the whole group, including
             // grandchildren spawned by the language server or shell.
-            unsafe {
-                libc::kill(-process_group, libc::SIGKILL);
+            // SAFETY: this PID identifies the owned process group; kill does not
+            // access Rust memory and a negative PID addresses that group.
+            if unsafe { libc::kill(-process_group, libc::SIGKILL) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
             }
         }
+        Ok(())
     }
 }
 
@@ -217,6 +228,7 @@ pub(crate) async fn read_process_output(
     timeout_ms: u64,
     max_output_bytes: usize,
     observer: Option<&dyn OutputObserver>,
+    cancellation: Option<Cancellation<'_>>,
 ) -> io::Result<CapturedProcessOutput> {
     let mut stdout = match child.stdout.take() {
         Some(stdout) => stdout,
@@ -238,7 +250,7 @@ pub(crate) async fn read_process_output(
     let mut stdout_buffer = vec![0_u8; READ_CHUNK_BYTES];
     let mut stderr_buffer = vec![0_u8; READ_CHUNK_BYTES];
 
-    let execution = tokio::time::timeout(tokio::time::Duration::from_millis(timeout_ms), async {
+    let deadline = tokio::time::timeout(tokio::time::Duration::from_millis(timeout_ms), async {
         while !stdout_done || !stderr_done {
             tokio::select! {
                 read = stdout.read(&mut stdout_buffer), if !stdout_done => {
@@ -279,11 +291,22 @@ pub(crate) async fn read_process_output(
         }
 
         child.wait().await
-    })
-    .await;
+    });
+    let cancel = async {
+        match cancellation {
+            Some(cancellation) => cancellation.await,
+            None => std::future::pending().await,
+        }
+    };
+    let execution = tokio::select! {
+        biased;
+        result = deadline => Some(result),
+        _ = cancel => None,
+    };
+    let cancelled = execution.is_none();
 
     let (status, timed_out, wait_error) = match execution {
-        Ok(Ok(status)) => {
+        Some(Ok(Ok(status))) => {
             // A shell can exit successfully while a background descendant
             // keeps running after closing both inherited pipes.  Tear down
             // the complete process group before returning so a successful
@@ -291,8 +314,29 @@ pub(crate) async fn read_process_output(
             process_group.kill();
             (Some(status), false, None)
         }
-        Ok(Err(error)) => (None, false, Some(error)),
-        Err(_) => {
+        Some(Ok(Err(error))) => (None, false, Some(error)),
+        None => {
+            if process_group.process_group.is_none() {
+                return Err(io::Error::other(
+                    "cancelled command has no process-group owner",
+                ));
+            }
+            let kill = process_group.try_kill();
+            let status = tokio::time::timeout(
+                tokio::time::Duration::from_millis(PROCESS_SETTLEMENT_MS),
+                child.wait(),
+            )
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "cancelled command cleanup did not settle",
+                )
+            })??;
+            kill?;
+            (Some(status), false, None)
+        }
+        Some(Err(_)) => {
             process_group.kill();
             child.start_kill().ok();
             let status = match tokio::time::timeout(
@@ -320,6 +364,7 @@ pub(crate) async fn read_process_output(
         stderr: capture.render_stream(OutputStream::Stderr),
         status,
         timed_out,
+        cancelled,
     })
 }
 
@@ -328,8 +373,9 @@ pub(super) async fn run_tokio_command(
     mut command: Command,
     request: CommandRequest,
     budget: &crate::policy::ResolvedResourceBudget,
+    cancellation: Option<Cancellation<'_>>,
     description: &str,
-) -> Result<CommandOutput> {
+) -> Result<(CommandOutput, CommandTermination)> {
     command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -345,16 +391,44 @@ pub(super) async fn run_tokio_command(
         budget.timeout_ms,
         budget.max_output_bytes,
         request.output_observer.as_deref(),
+        cancellation,
     )
     .await
     .with_context(|| format!("failed to wait for {description}"))?;
 
-    Ok(CommandOutput {
-        stdout: output.stdout,
-        stderr: output.stderr,
-        exit_code: output.status.and_then(|status| status.code()).unwrap_or(-1),
-        timed_out: output.timed_out,
-    })
+    let exit_code = output
+        .status
+        .and_then(|status| {
+            use std::os::unix::process::ExitStatusExt;
+            status.code().or_else(|| {
+                if output.cancelled {
+                    status.signal().map(|signal| 128 + signal)
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or(-1);
+    let termination = if output.cancelled {
+        anyhow::ensure!(
+            exit_code >= 0,
+            "cancelled command has no original exit status"
+        );
+        CommandTermination::Cancelled
+    } else if output.timed_out {
+        CommandTermination::TimedOut
+    } else {
+        CommandTermination::Completed
+    };
+    Ok((
+        CommandOutput {
+            stdout: output.stdout,
+            stderr: output.stderr,
+            exit_code,
+            timed_out: output.timed_out,
+        },
+        termination,
+    ))
 }
 
 #[cfg(unix)]
@@ -471,6 +545,51 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn cancellation_observes_the_original_child_terminal() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let root = directory.path().to_path_buf();
+        let execution = tokio::spawn(async move {
+            let mut child = spawn_test_shell(
+                &root,
+                "printf partial; printf partial > changed; (touch child-started; sleep 0.6; touch late) & wait",
+            );
+            read_process_output(
+                &mut child,
+                5_000,
+                MAX_OUTPUT_SIZE,
+                None,
+                Some(Box::pin(async {
+                    let _ = cancelled.await;
+                })),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !directory.path().join("child-started").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.send(()).unwrap();
+        let output = execution.await.unwrap().unwrap();
+        assert!(output.cancelled);
+        assert!(!output.timed_out);
+        assert_eq!(output.status.unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(output.stdout, "partial");
+        assert_eq!(
+            std::fs::read(directory.path().join("changed")).unwrap(),
+            b"partial"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        assert!(!directory.path().join("late").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn process_deadline_includes_wait_after_both_streams_close() {
         let directory = tempfile::tempdir().unwrap();
         let mut child = spawn_test_shell(
@@ -479,7 +598,7 @@ mod tests {
         );
         let started = std::time::Instant::now();
 
-        let output = read_process_output(&mut child, 50, MAX_OUTPUT_SIZE, None)
+        let output = read_process_output(&mut child, 50, MAX_OUTPUT_SIZE, None, None)
             .await
             .unwrap();
 
@@ -502,7 +621,7 @@ mod tests {
              (touch descendant-started; sleep 2; touch cancellation-leak) & wait",
         );
         let capture = tokio::spawn(async move {
-            read_process_output(&mut child, 5_000, MAX_OUTPUT_SIZE, None).await
+            read_process_output(&mut child, 5_000, MAX_OUTPUT_SIZE, None, None).await
         });
 
         // CI hosts can be slow to spawn the shell; allow a generous but
@@ -541,7 +660,7 @@ mod tests {
             "(touch descendant-started; exec 1>&- 2>&-; sleep 0.80; touch normal-exit-leak) & exit 0",
         );
 
-        let output = read_process_output(&mut child, 5_000, MAX_OUTPUT_SIZE, None)
+        let output = read_process_output(&mut child, 5_000, MAX_OUTPUT_SIZE, None, None)
             .await
             .unwrap();
         assert_eq!(output.status.unwrap().code(), Some(0));

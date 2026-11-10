@@ -1,5 +1,5 @@
 use crate::policy::EnforcedPolicy;
-use crate::{CommandOutput, CommandRequest};
+use crate::{Cancellation, CommandOutput, CommandRequest, CommandTermination};
 use anyhow::{bail, Result};
 use std::path::Path;
 
@@ -18,7 +18,8 @@ impl PlatformSandbox {
         &self,
         _policy: &EnforcedPolicy,
         _request: CommandRequest,
-    ) -> Result<CommandOutput> {
+        _cancellation: Option<Cancellation<'_>>,
+    ) -> Result<(CommandOutput, CommandTermination)> {
         bail!(
             "the kbox native sandbox is unsupported on {}",
             std::env::consts::OS
